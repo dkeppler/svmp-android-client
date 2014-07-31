@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 The MITRE Corporation, All Rights Reserved.
+ * Copyright (c) 2014 The MITRE Corporation, All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this work except in compliance with the License.
@@ -12,35 +12,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- */
-
-// Derived from GAEChannelClient from the libjingle / webrtc AppRTCDemo
-// example application distributed under the following license.
-/*
- * libjingle
- * Copyright 2013, Google Inc.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *  1. Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *  2. Redistributions in binary form must reproduce the above copyright notice,
- *     this list of conditions and the following disclaimer in the documentation
- *     and/or other materials provided with the distribution.
- *  3. The name of the author may not be used to endorse or promote products
- *     derived from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
- * EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 package org.mitre.svmp.apprtc;
@@ -67,6 +38,16 @@ import org.mitre.svmp.protocol.SVMPProtocol.Request.RequestType;
 import org.mitre.svmp.protocol.SVMPProtocol.Response.ResponseType;
 import org.mitre.svmp.common.StateMachine.STATE;
 import org.webrtc.MediaConstraints;
+
+import com.google.protobuf.InvalidProtocolBufferException;
+import com.koushikdutta.async.ByteBufferList;
+import com.koushikdutta.async.DataEmitter;
+import com.koushikdutta.async.callback.DataCallback;
+import com.koushikdutta.async.http.AsyncHttpClient;
+import com.koushikdutta.async.http.AsyncHttpClient.WebSocketConnectCallback;
+import com.koushikdutta.async.http.AsyncSSLEngineConfigurator;
+import com.koushikdutta.async.http.WebSocket;
+import com.koushikdutta.async.http.WebSocket.StringCallback;
 
 import javax.net.SocketFactory;
 import javax.net.ssl.*;
@@ -125,6 +106,9 @@ public class AppRTCClient extends Binder implements SensorEventListener, Constan
     private OutputStream socketOut;
     private SocketSender sender = null;
     private SocketListener listener = null;
+    
+    private AsyncHttpClient ahClient;
+    private Future<WebSocket> websocket;
 
     // STEP 0: NEW -> STARTED
     public AppRTCClient(SessionService service, StateMachine machine, ConnectionInfo connectionInfo) {
@@ -233,6 +217,7 @@ public class AppRTCClient extends Binder implements SensorEventListener, Constan
             }
         };
         socketShutdown.start();
+        
     }
 
     private void startProxying() {
@@ -339,9 +324,13 @@ public class AppRTCClient extends Binder implements SensorEventListener, Constan
             boolean useCertificateAuth = API_14 &&
                     (connectionInfo.getAuthType() & CertificateModule.AUTH_MODULE_ID) == CertificateModule.AUTH_MODULE_ID;
 
-            SocketFactory sf;
+//            SocketFactory sf;
 
             Log.d(TAG, "Socket connecting to " + connectionInfo.getHost() + ":" + connectionInfo.getPort());
+
+            ahClient = AsyncHttpClient.getDefaultInstance();
+            
+            String proto = "ws";
 
             if (useSsl) {
                 // set up key managers
@@ -380,15 +369,68 @@ public class AppRTCClient extends Binder implements SensorEventListener, Constan
 
                 SSLContext sslcontext = SSLContext.getInstance("TLS");
                 sslcontext.init(keyManagers, trustManagers, new SecureRandom());
-                SSLSocket socket = (SSLSocket) sslcontext.getSocketFactory().createSocket(connectionInfo.getHost(), connectionInfo.getPort());
-                socket.setEnabledCipherSuites(ENABLED_CIPHERS);
-                socket.setEnabledProtocols(ENABLED_PROTOCOLS);
-                svmpSocket = socket;
-            } else {
-                sf = SocketFactory.getDefault();
-                svmpSocket = sf.createSocket(connectionInfo.getHost(), connectionInfo.getPort());
+
+//                SSLSocket socket = (SSLSocket) sslcontext.getSocketFactory().createSocket(connectionInfo.getHost(), connectionInfo.getPort());
+//                socket.setEnabledCipherSuites(ENABLED_CIPHERS);
+//                socket.setEnabledProtocols(ENABLED_PROTOCOLS);
+//                svmpSocket = socket;
+
+                ahClient.getSSLSocketMiddleware().setSSLContext(sslcontext);
+                ahClient.getSSLSocketMiddleware().setTrustManagers(trustManagers);
+                //ahClient.getSSLSocketMiddleware().setHostnameVerifier(hostnameVerifier);
+                ahClient.getSSLSocketMiddleware().addEngineConfigurator(new AsyncSSLEngineConfigurator() {
+
+                    @Override
+                    public void configureEngine(SSLEngine engine, String host, int port) {
+                        engine.setEnabledCipherSuites(ENABLED_CIPHERS);
+                        engine.setEnabledProtocols(ENABLED_PROTOCOLS);
+                    }
+                });
+                proto = proto + "s";
             }
-            svmpSocket.setTcpNoDelay(true);
+
+//            } else {
+//                sf = SocketFactory.getDefault();
+//                svmpSocket = sf.createSocket(connectionInfo.getHost(), connectionInfo.getPort());
+//            }
+//            svmpSocket.setTcpNoDelay(true);
+
+            ahClient.websocket(proto+"://"+connectionInfo.getHost()+":"+connectionInfo.getPort(), 
+                    "svmp", new WebSocketConnectCallback() 
+            {
+                @Override
+                public void onCompleted(Exception ex, WebSocket webSocket) {
+                    if (ex != null) {
+                        ex.printStackTrace();
+                        return;
+                    }
+                    webSocket.send("a string");
+                    webSocket.send(new byte[10]);
+
+                    webSocket.setStringCallback(new StringCallback() {
+                        public void onStringAvailable(String s) {
+                            System.out.println("I got a string: " + s);
+                        }
+                    });
+
+                    webSocket.setDataCallback(new DataCallback() {
+                        @Override
+                        public void onDataAvailable(DataEmitter emitter, ByteBufferList byteBufferList) {
+                            // TODO parse the bytes into a ProtoBuf "Response"
+                            try {
+                                Request.parseFrom(byteBufferList.getAllByteArray());
+                                // TODO and dispatch it to some handler with a big switch block
+                            } catch (InvalidProtocolBufferException e) {
+                                // TODO Auto-generated catch block
+                                e.printStackTrace();
+                            } finally {
+                                // clean up
+                                byteBufferList.recycle();
+                            }
+                        }
+                    });
+                }
+            });
         }
     }
 
